@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 UltraSoC Technologies Limited
+ * Copyright (c) 2019,2020 UltraSoC Technologies Limited
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -46,7 +46,8 @@
  */
 static const te_discovery_response_t default_discovery_response =
 {
-    .call_counter_width = 7,    /* maximum of 512 calls on return_stack[] */
+    .call_counter_size = 9,     /* use a call-counter with a maximum of 512 calls */
+    .return_stack_size = 0,     /* no real irstack on encoder, if using a call-counter */
     .iaddress_lsb = 1,          /* 1 == compressed instructions supported */
     .jump_target_cache_size = TE_CACHE_SIZE_P,
     .branch_prediction_size = TE_BPRED_SIZE_P,
@@ -60,27 +61,59 @@ static const te_options_t default_support_options =
 {
     .full_address = false,      /* use differential addresses */
     .implicit_return = false,   /* disable using return_stack[] */
+    .implicit_exception = false,/* disable using implicit exception mode */
     .jump_target_cache = false, /* disable using jump_target[] */
     .branch_prediction = false, /* disable using a branch predictor */
 };
 
 
 /*
+ * array of error messages used by unrecoverable_error()
+ */
+static const char * const error_messages[TE_ERROR_NUM_ERRORS] =
+{
+    [TE_ERROR_OKAY]                 = NULL, /* this is NOT an error condition! */
+    [TE_ERROR_DEPLETED]             = "cannot resolve branch (branch-map depleted)!",
+    [TE_ERROR_UNINFERRABLE]         = "unexpected uninferrable discontinuity",
+    [TE_ERROR_BAD_FOLLOW]           = "follow_execution_path() has stop_at_last_branch=true and branches=0",
+    [TE_ERROR_UNPROCESSED]          = "unprocessed branches",
+    [TE_ERROR_IMPLICT_EXCEPTION]    = "implicit exception mode is not currently supported",
+    [TE_ERROR_NOT_FORMAT3]          = "expecting trace to start with a format 3 packet",
+};
+
+
+/*
  * Process an unrecoverable error with the trace-decoder's algorithm.
  * This is indicative of a serious malfunction - this should never happen!
+ *
  * This function prints a diagnostic, and it will call exit() to terminate.
  * If the parameter "instr" is not NULL, then it will also print the
  * disassembly line of the instruction ("instr") passed in.
- * NOTE: this function will never return to its caller!
+ *
+ * NOTE: this function will (by default) return to its caller!
  * However, any functions registered with atexit() will be called.
+ *
+ * That said, this source file (in toto) should assume that this
+ * function *might* actually return, as some users may wish not to
+ * call exit() directly here, and have higher functions detect that
+ * decoder->error_code != TE_ERROR_OKAY, and process accordingly.
+ * Thus, any callers of unrecoverable_error() should always assume
+ * it *does* return, and return immediately to its caller, et. seq.
  */
 static void unrecoverable_error(
-    const te_decoded_instruction_t * const instr,
-    const char * const message)
+    te_decoder_state_t * const decoder,
+    const te_error_code_t error_code,
+    const te_decoded_instruction_t * const instr)
 {
-    assert(message);
+    assert(decoder);
+    assert(TE_ERROR_OKAY == decoder->error_code);
+    assert(TE_ERROR_OKAY != error_code);
+    assert(TE_ERROR_NUM_ERRORS > error_code);
 
-    fprintf(stderr, "ERROR: %s\n", message);
+    /* first, save the error code in the decoder structure */
+    decoder->error_code = error_code;
+
+    fprintf(stderr, "ERROR: %s\n", error_messages[error_code]);
 
     if (instr)
     {
@@ -99,13 +132,14 @@ static void unrecoverable_error(
  * that address (using the external function te_get_instruction), and then use
  * the open-source riscv-disassembler library to decode, and then cache it.
  */
-static te_decoded_instruction_t * get_instr(
+#define get_instr te_get_and_disassemble_instr  /* alias the function */
+te_decoded_instruction_t * te_get_and_disassemble_instr(
     te_decoder_state_t * const decoder,
     const te_address_t address,
     te_decoded_instruction_t * const instr)
 {
     const size_t slot = TE_SLOT_NUMBER(address);
-    rv_inst instruction;
+    rv_inst instruction = 0;
     unsigned length;
 
     assert(decoder);
@@ -227,7 +261,7 @@ static void disseminate_pc(
     if ((decoder->debug_stream) && (decoder->debug_flags & TE_DEBUG_PC_TRANSITIONS))
     {
         fprintf(decoder->debug_stream,
-            "%s\t[%2lu] set_pc %8" PRIx64 " -> %8" PRIx64 ":\t%s\n",
+            "%s\t[%2" PRIu64 "] set_pc %8" PRIx64 " -> %8" PRIx64 ":\t%s\n",
             (decoder->pc == decoder->last_sent_addr) ? "---->" : "",
             decoder->branches,
             decoder->last_pc,
@@ -276,6 +310,9 @@ static bool is_branch(
 /*
  * Determine if current instruction is a branch, adjust the branch
  * count/map, and return the "taken" status
+ *
+ * If an unrecoverable error occurs, this function will immeditely
+ * return false, if the function unrecoverable_error() returns.
  */
 static bool is_taken_branch(
     te_decoder_state_t * const decoder,
@@ -296,9 +333,8 @@ static bool is_taken_branch(
 
     if (0 == decoder->branches)
     {
-        unrecoverable_error(instr,
-            "cannot resolve branch (branch-map depleted)!");
-        return false;
+        unrecoverable_error(decoder, TE_ERROR_DEPLETED, instr);
+        return false;       /* return immediately if an unrecoverable error */
     }
 
     /* this branch will be processed, decrement remaining branches */
@@ -374,15 +410,15 @@ static bool is_taken_branch(
         {
             const bool previous_outcome = !!(old_state & 0x1u);
             fprintf(decoder->debug_stream,
-                "bpred-%u: %" PRIx64 ", bpred_table[%02" PRIx64 "] = %u%u -> %u%u,"
-                "  branches = %2lu,  %-8s  %-9s  %s\n",
+                "bpred-%u: %" PRIx64 ", bpred_table[%02" PRIx64 "] = %d%d -> %d%d,"
+                "  branches = %2" PRIu64 ",  %-8s  %-9s  %s\n",
                 ++decoder->bpred.serial,
                 instr->decode.pc,
                 bpred_index,
-                predicted_outcome,      /* MSB */
-                previous_outcome,       /* LSB */
-                !!(new_state & 0x2u),   /* MSB */
-                !!(new_state & 0x1u),   /* LSB */
+                (predicted_outcome) ? 1 : 0,    /* MSB */
+                (previous_outcome)  ? 1 : 0,    /* LSB */
+                (new_state & 0x2u)  ? 1 : 0,    /* MSB */
+                (new_state & 0x1u)  ? 1 : 0,    /* LSB */
                 decoder->branches,
                 source,
                 taken ? "TAKEN" : "not taken",
@@ -566,24 +602,44 @@ static bool is_call(
  */
 static bool is_implicit_return(
     const te_decoder_state_t * const decoder,
-    const te_decoded_instruction_t * const instr)
+    const te_decoded_instruction_t * const instr,
+    const te_inst_t * const te_inst)
 {
     bool predicate = false;
     assert(decoder);
     assert(instr);
+    assert(te_inst);
 
     if (decoder->options.implicit_return == 0)
     {
         return false;   /* Implicit return mode is disabled */
     }
 
+    /*
+     * In the following code the value of "te_inst->irfail" is
+     * not the value of the irfail bit physically transmitted
+     * in the te_inst packet. Instead it is a logical XOR
+     * that indicates if the irfail bit physically transmitted
+     * was different from the previously transmitted bit.
+     * See comment in the definition of "te_inst_t" for details.
+     */
     if ( ( (instr->decode.op == rv_op_jalr) &&
            (1 == instr->decode.rs1)         &&
            (0 == instr->decode.rd) )        ||
          ( (instr->decode.op == rv_op_c_jr) &&
            (1 == instr->decode.rs1) ) )
     {
-        predicate = (decoder->call_counter > 0);
+        if ( (te_inst->irfail) &&
+             (te_inst->irdepth == decoder->irstack_depth) )
+        {
+            /* implicit return address prediction failed here */
+            predicate = false;
+        }
+        else
+        {
+            /* return true if the irstack is not empty */
+            predicate = (decoder->irstack_depth > 0);
+        }
     }
 
     return predicate;
@@ -591,7 +647,7 @@ static bool is_implicit_return(
 
 
 /*
- * Push address onto return stack
+ * Push address onto the implicit return stack
  */
 static void push_return_stack(
     te_decoder_state_t * const decoder,
@@ -608,15 +664,18 @@ static void push_return_stack(
         return;     /* Implicit return mode is disabled */
     }
 
-    const size_t call_counter_max = (size_t)1 << (decoder->discovery_response.call_counter_width + 2);
-    assert(decoder->call_counter <= call_counter_max);
-    assert(call_counter_max <= TE_MAX_CALL_DEPTH);
+    const size_t irstack_depth_max =
+        (decoder->discovery_response.return_stack_size) ?
+            (size_t)1 << decoder->discovery_response.return_stack_size :
+            (size_t)1 << decoder->discovery_response.call_counter_size;
+    assert(decoder->irstack_depth <= irstack_depth_max);
+    assert(irstack_depth_max <= TE_MAX_IRSTACK_DEPTH);
 
-    if (call_counter_max == decoder->call_counter)
+    if (irstack_depth_max == decoder->irstack_depth)
     {
-        /* Delete oldest entry from stack to make room for new entry added below */
-        decoder->call_counter--;
-        for (i = 0; i < decoder->call_counter; i++)
+        /* Delete oldest entry from irstack to make room for new entry added below */
+        decoder->irstack_depth--;
+        for (i = 0; i < decoder->irstack_depth; i++)
         {
             decoder->return_stack[i] = decoder->return_stack[i+1];
         }
@@ -626,23 +685,23 @@ static void push_return_stack(
     (void)get_instr(decoder, address, &instr);
     link_reg += instruction_size(&instr);
 
-    /* optionally show what we will push onto the call stack */
-    if ((decoder->debug_stream) && (decoder->debug_flags & TE_DEBUG_CALL_STACK))
+    /* optionally show what we will push onto the irstack */
+    if ((decoder->debug_stream) && (decoder->debug_flags & TE_DEBUG_IMPLICIT_RETURN))
     {
         fprintf(decoder->debug_stream,
-            "call-stack: pushed [%3" PRIu64 "] <-- %08" PRIx64 "\n",
-            decoder->call_counter,
+            "irstack: pushed [%3" PRIu64 "] <-- %08" PRIx64 "\n",
+            decoder->irstack_depth,
             link_reg);
     }
 
-    /* push link register to top of the stack */
-    decoder->return_stack[decoder->call_counter] = link_reg;
-    decoder->call_counter++;
+    /* push link register to top of the irstack */
+    decoder->return_stack[decoder->irstack_depth] = link_reg;
+    decoder->irstack_depth++;
 }
 
 
 /*
- * Pop address from return stack
+ * Pop address from the implicit return stack
  */
 static te_address_t pop_return_stack(
     te_decoder_state_t * const decoder)
@@ -650,19 +709,19 @@ static te_address_t pop_return_stack(
     assert(decoder);
 
     /*
-     * Note: this function is not called if call_counter is 0,
+     * Note: this function is not called if irstack_depth is 0,
      * so no need to check for underflow
      */
-    decoder->call_counter--;
+    decoder->irstack_depth--;
 
-    const te_address_t link_reg = decoder->return_stack[decoder->call_counter];
+    const te_address_t link_reg = decoder->return_stack[decoder->irstack_depth];
 
-    /* optionally show what we will pop from the call stack */
-    if ((decoder->debug_stream) && (decoder->debug_flags & TE_DEBUG_CALL_STACK))
+    /* optionally show what we will pop from the irstack */
+    if ((decoder->debug_stream) && (decoder->debug_flags & TE_DEBUG_IMPLICIT_RETURN))
     {
         fprintf(decoder->debug_stream,
-            "call-stack: popped [%3" PRIu64 "] --> %08" PRIx64 "\n",
-            decoder->call_counter,
+            "irstack: popped [%3" PRIu64 "] --> %08" PRIx64 "\n",
+            decoder->irstack_depth,
             link_reg);
     }
 
@@ -674,17 +733,22 @@ static te_address_t pop_return_stack(
  * Compute the next PC
  *
  * Returns true if it is an uninferrable discontinuity,
- * and a return address was NOT popped from a call-stack.
+ * and a return address was NOT popped from the irstack.
  * i.e. the parameter "address" is assigned to the PC.
  * Otherwise this function returns false.
+ *
+ * If an unrecoverable error occurs, this function will immeditely
+ * return false, if the function unrecoverable_error() returns.
  */
 static bool next_pc(
     te_decoder_state_t * const decoder,
-    const te_address_t address)
+    const te_address_t address,
+    const te_inst_t * const te_inst)
 {
     bool stop_here = false;
 
     assert(decoder);
+    assert(te_inst);
 
     const te_address_t this_pc = decoder->pc;
     te_decoded_instruction_t instr = { .decode.pc = TE_SENTINEL_BAD_ADDRESS };
@@ -707,7 +771,7 @@ static bool next_pc(
         /* lui/auipc followed by jump using same register */
         decoder->pc = sequential_jump_target(decoder, decoder->pc, decoder->last_pc);
     }
-    else if (is_implicit_return(decoder, &instr))
+    else if (is_implicit_return(decoder, &instr, te_inst))
     {
         decoder->pc = pop_return_stack(decoder);
     }
@@ -715,8 +779,8 @@ static bool next_pc(
     {
         if (decoder->stop_at_last_branch)
         {
-            unrecoverable_error(&instr,
-                "unexpected uninferrable discontinuity");
+            unrecoverable_error(decoder, TE_ERROR_UNINFERRABLE, &instr);
+            return false;    /* return immediately if an unrecoverable error */
         }
         else
         {
@@ -735,6 +799,14 @@ static bool next_pc(
     }
     else
     {
+        /*
+         * Note: is_taken_branch() can call unrecoverable_error(),
+         * returning false if unrecoverable_error() returns.
+         */
+        if (TE_ERROR_OKAY != decoder->error_code)
+        {
+            return false; /* return immediately if an unrecoverable error */
+        }
         decoder->pc += instruction_size(&instr);
     }
 
@@ -754,6 +826,9 @@ static bool next_pc(
 
 /*
  * Follow execution path to reported address
+ *
+ * If an unrecoverable error occurs, this function will immeditely
+ * return, if the function unrecoverable_error() returns.
  */
 static void follow_execution_path(
     te_decoder_state_t * const decoder,
@@ -781,8 +856,8 @@ static void follow_execution_path(
         if ( (decoder->stop_at_last_branch) &&
              (0 == decoder->branches) )
         {
-            unrecoverable_error(&instr,
-                "follow_execution_path() has stop_at_last_branch=true and branches=0");
+            unrecoverable_error(decoder, TE_ERROR_BAD_FOLLOW, &instr);
+            return; /* return immediately if an unrecoverable error */
         }
 
         if (decoder->inferred_address)
@@ -790,7 +865,15 @@ static void follow_execution_path(
             /*
              * iterate again from previously reported address to find second occurrence
              */
-            const bool stop_here = next_pc(decoder, previous_address);
+            const bool stop_here = next_pc(decoder, previous_address, te_inst);
+            /*
+             * Note: next_pc() can call unrecoverable_error(),
+             * returning false if unrecoverable_error() returns.
+             */
+            if (TE_ERROR_OKAY != decoder->error_code)
+            {
+                return; /* return immediately if an unrecoverable error */
+            }
             (void)get_instr(decoder, decoder->pc, &instr);
             if (stop_here)
             {
@@ -799,7 +882,15 @@ static void follow_execution_path(
         }
         else
         {
-            const bool stop_here = next_pc(decoder, address);
+            const bool stop_here = next_pc(decoder, address, te_inst);
+            /*
+             * Note: next_pc() can call unrecoverable_error(),
+             * returning false if unrecoverable_error() returns.
+             */
+            if (TE_ERROR_OKAY != decoder->error_code)
+            {
+                return; /* return immediately if an unrecoverable error */
+            }
             (void)get_instr(decoder, decoder->pc, &instr);
             if ( (1 == decoder->branches)                             &&
                  (is_branch(get_instr(decoder, decoder->pc, &instr))) &&
@@ -822,25 +913,43 @@ static void follow_execution_path(
                     /*
                      * Check all branches processed (except 1 if this instruction is a branch)
                      */
-                    unrecoverable_error(&instr,
-                        "unprocessed branches");
+                    unrecoverable_error(decoder, TE_ERROR_UNPROCESSED, &instr);
+                    return; /* return immediately if an unrecoverable error */
                 }
+                return;
+            }
+            /*
+             * In the following code the value of "te_inst->notify" is
+             * not the value of the notify bit physically transmitted
+             * in the te_inst packet. Instead it is a logical XOR
+             * that indicates if the notify bit physically transmitted
+             * was different from the previously transmitted bit.
+             * See comment in the definition of "te_inst_t" for details.
+             */
+            if ( (TE_INST_FORMAT_3_SYNC != te_inst->format)     &&
+                 (decoder->pc == address)                       &&
+                 (!decoder->stop_at_last_branch)                &&
+                 (te_inst->notify)                              &&
+                 (decoder->branches == (is_branch(get_instr(decoder, decoder->pc, &instr)) ? 1 : 0)) )
+            {
+                /*
+                 * All branches processed, and reached reported address due
+                 * to notification, and not as an uninferrable jump target
+                 */
                 return;
             }
             /*
              * In the following code the value of "te_inst->updiscon" is
              * not the value of the updiscon bit physically transmitted
-             * in the te_inst packet. Instead it is a logical flag to
-             * indicate if the updiscon bit physically transmitted should
-             * be inverted. The de-serializer will perform the XOR.
-             * That is, the XOR has already been done, and there is
-             * no need to compare it against the previously transmitted
-             * bit here (i.e. the MSB of the address field).
+             * in the te_inst packet. Instead it is a logical XOR
+             * that indicates if the updiscon bit physically transmitted
+             * was different from the previously transmitted bit.
+             * See comment in the definition of "te_inst_t" for details.
              */
             if ( (TE_INST_FORMAT_3_SYNC != te_inst->format)     &&
                  (decoder->pc == address)                       &&
-                 (!te_inst->updiscon)                           &&
                  (!decoder->stop_at_last_branch)                &&
+                 (!te_inst->updiscon)                           &&
                  (decoder->branches == (is_branch(get_instr(decoder, decoder->pc, &instr)) ? 1 : 0)) )
             {
                 /*
@@ -876,11 +985,27 @@ do                                                              \
             support->options.option ? "true" : "false");        \
     }                                                           \
 } while (0)
+#define PRINT_CHANGES_FIELD(s_option,d_option)                  \
+do                                                              \
+{                                                               \
+    if (decoder->d_option != support->s_option)                 \
+    {                                                           \
+        fprintf(                                                \
+            decoder->debug_stream,                              \
+            "info: configuration of %s changed: %u -> %u\n",    \
+            #s_option,                                          \
+            decoder->d_option,                                  \
+            support->s_option);                                 \
+    }                                                           \
+} while (0)
 
 
 /*
  * Process a single te_inst synchronization support packet.
  * Called each time a support packet is received.
+ *
+ * If an unrecoverable error occurs, this function will immeditely
+ * return, if the function unrecoverable_error() returns.
  */
 static void process_support(
     te_decoder_state_t * const decoder,
@@ -897,10 +1022,15 @@ static void process_support(
      */
     if (decoder->debug_stream)
     {
+        /* single-bit run-time configuration options */
         PRINT_CHANGES_FLAG(implicit_return);
+        PRINT_CHANGES_FLAG(implicit_exception);
         PRINT_CHANGES_FLAG(full_address);
         PRINT_CHANGES_FLAG(jump_target_cache);
         PRINT_CHANGES_FLAG(branch_prediction);
+
+        /* multi-bit run-time configuration options */
+        PRINT_CHANGES_FIELD(encoder_mode, encoder_mode);
     }
 
     /*
@@ -909,6 +1039,14 @@ static void process_support(
      * options that the trace-decoder will now use.
      */
     decoder->options = support->options;
+    decoder->encoder_mode = support->encoder_mode;
+
+    if (decoder->options.implicit_exception)
+    {
+        /* TODO: support the implicit exception mode */
+        unrecoverable_error(decoder, TE_ERROR_IMPLICT_EXCEPTION, NULL);
+        return; /* return immediately if an unrecoverable error */
+    }
 
     if ( (TE_QUAL_STATUS_ENDED_UPD == support->qual_status) ||
          (TE_QUAL_STATUS_ENDED_REP == support->qual_status) )
@@ -924,7 +1062,15 @@ static void process_support(
         decoder->inferred_address = false;
         while (true)
         {
-            const bool stop_here = next_pc(decoder, previous_address);
+            const bool stop_here = next_pc(decoder, previous_address, te_inst);
+            /*
+             * Note: next_pc() can call unrecoverable_error(),
+             * returning false if unrecoverable_error() returns.
+             */
+            if (TE_ERROR_OKAY != decoder->error_code)
+            {
+                return; /* return immediately if an unrecoverable error */
+            }
             if (stop_here)
             {
                 return;
@@ -937,6 +1083,9 @@ static void process_support(
 /*
  * Process a single te_inst packet.
  * Called each time a te_inst packet is received.
+ *
+ * If an unrecoverable error occurs, this function will immeditely
+ * return, if the function unrecoverable_error() returns.
  */
 void te_process_te_inst(
     te_decoder_state_t * const decoder,
@@ -946,6 +1095,45 @@ void te_process_te_inst(
 
     assert(decoder);
     assert(te_inst);
+
+    /*
+     * The caller of this function is expected to set the field
+     * "with_address" in the structure pointed to by te_inst.
+     * However, as a "sanity check", it is compared here against
+     * what it ought to be, given the values of the other fields.
+     */
+    switch (te_inst->format)
+    {
+        case TE_INST_FORMAT_0_EXTN:
+            if (TE_INST_EXTN_BRANCH_PREDICTOR == te_inst->extension)
+            {
+                assert( (TE_BRANCH_FMT_00_NO_ADDR != te_inst->u.bpred.branch_fmt) == te_inst->with_address);
+            }
+            break;
+
+        case TE_INST_FORMAT_1_DIFF:
+            assert(te_inst->with_address == !!te_inst->branches);
+            break;
+
+        case TE_INST_FORMAT_2_ADDR:
+            assert(te_inst->with_address);
+            break;
+
+        case TE_INST_FORMAT_3_SYNC:
+            if ( (TE_INST_SUBFORMAT_START == te_inst->subformat) ||
+                 (TE_INST_SUBFORMAT_EXCEPTION == te_inst->subformat) )
+            {
+                assert(te_inst->with_address);
+            }
+            else
+            {
+                assert(!te_inst->with_address);
+            }
+            break;
+
+        default:
+            assert(!"Invalid packet format");
+    }
 
     /*
      * update counters for each new te_inst packet that is received
@@ -964,6 +1152,7 @@ void te_process_te_inst(
         if (TE_INST_SUBFORMAT_SUPPORT == te_inst->subformat)
         {
             process_support(decoder, te_inst);
+            /* Note: process_support() can call unrecoverable_error() */
             return; /* all done ... nothing more to do */
         }
 
@@ -1004,6 +1193,11 @@ void te_process_te_inst(
              (!decoder->start_of_trace) )
         {
             follow_execution_path(decoder, decoder->last_sent_addr, te_inst);
+            /* Note: follow_execution_path() can call unrecoverable_error() */
+            if (TE_ERROR_OKAY != decoder->error_code)
+            {
+                return; /* return immediately if an unrecoverable error */
+            }
         }
         else
         {
@@ -1039,17 +1233,17 @@ void te_process_te_inst(
          * Perform all the necessary re-initialization actions here,
          * on receipt of such a "synchronization packet".
          *
+         * At this point, we should be processing either a format 3
+         * subformat 0 or a subformat 1 packet, as we would have
+         * already returned if it was a support or context packet.
+         *
          * The trace-encoder will reinitialise the jump target cache on sync,
          * and will only ever send an index after having already sent the
          * address, hence the decoder’s jump target cache entries are always
          * guaranteed to be valid when referenced. Thus there is no need to
          * reinitialise/invalidate the decoder’s jump target cache at all!
          */
-        if ( (TE_INST_SUBFORMAT_START == te_inst->subformat) ||
-             (TE_INST_SUBFORMAT_EXCEPTION == te_inst->subformat) )
-        {
-            decoder->call_counter = 0;
-        }
+        decoder->irstack_depth = 0;
     }
     else
     {
@@ -1062,8 +1256,8 @@ void te_process_te_inst(
         if (decoder->start_of_trace)
         {
             /* This should not be possible! */
-            unrecoverable_error(NULL,
-                "Expecting trace to start with a format 3 packet");
+            unrecoverable_error(decoder, TE_ERROR_NOT_FORMAT3, NULL);
+            return; /* return immediately if an unrecoverable error */
         }
 
         /* extract the latest address, and update last_sent_addr */
@@ -1082,18 +1276,18 @@ void te_process_te_inst(
         /* assume we do not have a branch_count */
         decoder->bpred.correct_predictions = 0;
 
-        if ( (TE_INST_FORMAT_0_EXTN == te_inst->format) &&
+        if ( (decoder->options.branch_prediction) &&
+             (TE_INST_FORMAT_0_EXTN == te_inst->format) &&
              (TE_INST_EXTN_BRANCH_PREDICTOR == te_inst->extension) )
         {
-            assert(decoder->options.branch_prediction);
-            assert(te_inst->correct_predictions);
+            assert(te_inst->u.bpred.correct_predictions);
             assert(decoder->branches <= 1u);
             decoder->statistics.num_extention[te_inst->extension]++;
             decoder->bpred.use_bmap_first =
                 (!!decoder->branches) &&
                 (!decoder->bpred.miss_predict_carry_in);
-            decoder->bpred.correct_predictions = te_inst->correct_predictions;
-            decoder->branches += te_inst->correct_predictions;
+            decoder->bpred.correct_predictions = te_inst->u.bpred.correct_predictions;
+            decoder->branches += te_inst->u.bpred.correct_predictions;
             /* if no address, then one additional miss-predict too */
             if (!te_inst->with_address)
             {
@@ -1102,21 +1296,21 @@ void te_process_te_inst(
                 decoder->bpred.miss_predict_carry_out = true;
             }
         }
-        else if ( (TE_INST_FORMAT_0_EXTN == te_inst->format) &&
+        else if ( (decoder->options.jump_target_cache) &&
+                  (TE_INST_FORMAT_0_EXTN == te_inst->format) &&
                   (TE_INST_EXTN_JUMP_TARGET_CACHE == te_inst->extension) )
         {
-            assert(decoder->options.jump_target_cache);
             decoder->statistics.num_extention[te_inst->extension]++;
             decoder->stop_at_last_branch = false;
             /* use the address in the jump target cache */
-            assert(te_inst->jtc_index < elements_of(decoder->jump_target));
-            decoder->last_sent_addr = decoder->jump_target[te_inst->jtc_index];
+            assert(te_inst->u.jtc.index < elements_of(decoder->jump_target));
+            decoder->last_sent_addr = decoder->jump_target[te_inst->u.jtc.index];
             if ( (decoder->debug_stream) &&
                  (decoder->debug_flags & TE_DEBUG_JUMP_TARGET_CACHE) )
             {
                 fprintf(decoder->debug_stream,
                     "jump-cache: using jump_target[%x] = %" PRIx64 "\n",
-                    te_inst->jtc_index,
+                    te_inst->u.jtc.index,
                     decoder->last_sent_addr);
             }
             /* is there also a branch-map included ? */
@@ -1145,7 +1339,7 @@ void te_process_te_inst(
                         fprintf(decoder->debug_stream,
                             "jump-cache: writing %" PRIx64 " to jump_target[%x]\n",
                             decoder->last_sent_addr,
-                            te_inst->jtc_index);
+                            te_inst->u.jtc.index);
                     }
                 }
             }
@@ -1175,6 +1369,11 @@ void te_process_te_inst(
             }
         }
         follow_execution_path(decoder, decoder->last_sent_addr, te_inst);
+        /* Note: follow_execution_path() can call unrecoverable_error() */
+        if (TE_ERROR_OKAY != decoder->error_code)
+        {
+            return; /* return immediately if an unrecoverable error */
+        }
     }
 }
 
@@ -1228,6 +1427,7 @@ te_decoder_state_t * te_open_trace_decoder(
      */
     decoder->discovery_response = default_discovery_response;
     decoder->options = default_support_options;
+    decoder->encoder_mode = TE_ENCODER_MODE_DELTA;
 
     return decoder;
 }

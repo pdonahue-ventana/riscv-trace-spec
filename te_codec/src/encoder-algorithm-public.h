@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 UltraSoC Technologies Limited
+ * Copyright (c) 2019,2020 UltraSoC Technologies Limited
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -51,6 +51,7 @@ typedef struct
 {
     uint16_t            max_resync;     /* 12-bits */
     bool                resync_cycles;  /* 1-bit */
+    te_encoder_mode_t   encoder_mode;   /* TE_ENCODER_MODE_BITS-bits */
 } te_set_trace_t;
 
 
@@ -87,7 +88,7 @@ typedef struct
  * with each core being traced having its own unique instance
  * of this structure (and hence state)
  */
-typedef struct
+typedef struct te_encoder_state_t
 {
     /*
      * Following is the "normalized" (i.e. un-shifted, non-differential) address
@@ -104,8 +105,10 @@ typedef struct
     uint32_t branch_map;    /* a maximum of 31 such taken bits */
     /* flag to indicate this not the first qualified instruction */
     bool start_sent;
-    /* top of stack, zero == call stack is empty */
-    size_t call_counter;
+
+    /* depth of the return address stack, zero == stack is empty */
+    size_t irstack_depth;
+
     /* flag to indicate if we need to notify due to a new context */
     bool context_pending;
 
@@ -134,7 +137,8 @@ typedef struct
      * set of run-time configuration "option" bits from the most
      * recently sent te_inst synchronization support packet
      */
-    te_options_t options;
+    te_options_t        options;
+    te_encoder_mode_t   encoder_mode;
 
     /* fields from the most recent set_trace configuration */
     te_set_trace_t set_trace;
@@ -204,7 +208,7 @@ extern void te_send_te_inst_sync_support(
  */
 extern void te_send_te_inst(
     void * const user_data,
-    te_inst_t * const te_inst);
+    const te_inst_t * const te_inst);
 
 extern bool te_prefer_jtc_extension(
     void * const user_data,

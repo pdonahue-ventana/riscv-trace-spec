@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 UltraSoC Technologies Limited
+ * Copyright (c) 2019,2020 UltraSoC Technologies Limited
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -41,7 +41,6 @@
 #include <assert.h>
 #include <stdlib.h>
 #include "encoder-algorithm-public.h"
-#include "decoder-algorithm-internal.h"
 #include "te-codec-utilities.h"
 
 
@@ -57,7 +56,8 @@
  */
 static const te_discovery_response_t default_discovery_response =
 {
-    .call_counter_width = 7,    /* maximum of 512 calls on return_stack[] */
+    .call_counter_size = 9,     /* use a call-counter with a maximum of 512 calls */
+    .return_stack_size = 0,     /* no real irstack on encoder, if using a call-counter */
     .iaddress_lsb = 1,          /* 1 == compressed instructions supported */
     .jump_target_cache_size = TE_CACHE_SIZE_P,
     .branch_prediction_size = TE_BPRED_SIZE_P,
@@ -71,6 +71,7 @@ static const te_options_t default_support_options =
 {
     .full_address = false,      /* use differential addresses */
     .implicit_return = false,   /* disable using return_stack[] */
+    .implicit_exception = false,/* disable using implicit exception mode */
     .jump_target_cache = false, /* disable using jump_target[] */
     .branch_prediction = false, /* disable using a branch predictor */
 };
@@ -80,6 +81,7 @@ static const te_set_trace_t default_set_trace =
 {
     .max_resync = 1u,           /* resync timer expires at 16 times this value */
     .resync_cycles = false,     /* resync timer counts te_inst packets when false */
+    .encoder_mode = TE_ENCODER_MODE_DELTA,  /* use delta 1 mode, by default */
 };
 
 
@@ -277,9 +279,12 @@ static void send_te_inst_sync(
     const te_inst_subformat_t subformat,
     const te_qual_status_t qual_status)
 {
-    te_inst_t te_inst = {0};
-
     assert(encoder);
+
+    te_inst_t te_inst =
+    {
+        .icount = encoder->statistics.num_instructions,
+    };
 
     /*
      * Note: take care ... irecord might be NULL here!
@@ -320,7 +325,29 @@ static void send_te_inst_sync(
             assert(irecord);
             te_inst.ecause = irecord->exception_cause;
             te_inst.interrupt = irecord->is_interrupt;
-            te_inst.tval = irecord->tval;
+            /*
+             * in most cases, we simply assign tval to tvalepc ...
+             * but if it is an illegal instruction, use epc instead!
+             */
+            if (te_is_illegal_instruction(&te_inst))
+            {
+                /*
+                 * We ideally want to use the Exception Program Counter
+                 * here ... but we do not have direct access to it ...
+                 * but we can still calculate the address of the
+                 * illegal instruction none the less!
+                 * The address of the illegal instruction can be
+                 * derived from the iaddress and iretires inputs.
+                 * Basically it is: iaddress + (2*iretires)
+                 * TODO ... just use a bad address for now!
+                 */
+                te_inst.tvalepc = TE_SENTINEL_BAD_ADDRESS;
+            }
+            else
+            {
+                te_inst.tvalepc = irecord->tval;
+            }
+            assert(TE_SENTINEL_BAD_ADDRESS != te_inst.tvalepc);
             /*lint -fallthrough */ /* no break */
         case TE_INST_SUBFORMAT_START:
             assert(irecord);
@@ -342,8 +369,10 @@ static void send_te_inst_sync(
             /*
              * fill in the qualification status for instruction trace
              * te_inst synchronization support packets.
-             * also copy the current set of run-time "options" bits.
+             * also copy the current set of run-time "options" bits,
+             * and anything else we wish to sent in a support packet.
              */
+            te_inst.support.encoder_mode = encoder->encoder_mode;
             te_inst.support.options = encoder->options;
             te_inst.support.qual_status = qual_status;
             break;
@@ -386,23 +415,23 @@ static void send_te_inst_sync(
         encoder->resync_count = 0;
 
         /*
-         * The specification requires that the counter for a call-stack is
+         * The specification requires that the depth for the irstack is
          * reset to zero when we send a "synchronization packet".
          * Optionally, we may want to log (for debugging) exactly how
-         * many current entries in the call-stack we are about to drop!
-         * Note: Dropping such return addresses from the call-stack is
+         * many current entries in the irstack we are about to drop!
+         * Note: Dropping such return addresses from the irstack is
          * NOT a real problem ... just an efficiency impact!
          */
-        if (encoder->call_counter)
+        if (encoder->irstack_depth)
         {
-            if ((encoder->debug_stream) && (encoder->debug_flags & TE_DEBUG_CALL_STACK))
+            if ((encoder->debug_stream) && (encoder->debug_flags & TE_DEBUG_IMPLICIT_RETURN))
             {
                 fprintf(encoder->debug_stream,
-                    "call-stack: dropping a total of %" PRIu64
-                    " entries from the call-stack!\n",
-                    encoder->call_counter);
+                    "irstack: dropping a total of %" PRIu64
+                    " entries from the irstack!\n",
+                    encoder->irstack_depth);
             }
-            encoder->call_counter = 0;  /* drop them all */
+            encoder->irstack_depth = 0;  /* drop them all */
         }
     }
 }
@@ -460,6 +489,7 @@ static void send_te_inst_non_sync(
         .address = curr->pc,
         .branches = encoder->branches,
         .branch_map = encoder->branch_map,
+        .icount = encoder->statistics.num_instructions,
     };
 
     /*
@@ -503,7 +533,7 @@ static void send_te_inst_non_sync(
          * if the jump target cache is enabled.
          */
         encoder->jump_target[jtc_index] = curr->pc;
-        te_inst.jtc_index = jtc_index;
+        te_inst.u.jtc.index = jtc_index;
         /*
          * finally, is a jump target cache extension packet #0 legal,
          * and is it really the best (most efficient) option ?
@@ -536,10 +566,23 @@ static void send_te_inst_non_sync(
         te_inst.format = TE_INST_FORMAT_0_EXTN;
         te_inst.extension = TE_INST_EXTN_BRANCH_PREDICTOR;
         encoder->statistics.num_extention[te_inst.extension]++;
-        te_inst.correct_predictions = encoder->bpred.correct_predictions;
+        te_inst.u.bpred.correct_predictions = encoder->bpred.correct_predictions;
         te_inst.branches = 0;
         te_inst.branch_map = 0;
-        assert(encoder->branches - ((with_address) ? 0u : 1u) == encoder->bpred.correct_predictions);
+        if (!with_address)
+        {
+            te_inst.u.bpred.branch_fmt = TE_BRANCH_FMT_00_NO_ADDR;
+            assert(encoder->branches - 1u == encoder->bpred.correct_predictions);
+        }
+        else if (encoder->branches == encoder->bpred.correct_predictions)
+        {
+            te_inst.u.bpred.branch_fmt = TE_BRANCH_FMT_10_ADDR;
+        }
+        else
+        {
+            te_inst.u.bpred.branch_fmt = TE_BRANCH_FMT_11_ADDR_FAIL;
+            assert(encoder->branches - 1u == encoder->bpred.correct_predictions);
+        }
 
         /* update min, max, and accumulators for the branch-predictor */
         if (encoder->bpred.correct_predictions > encoder->statistics.bpred.longest_sent)
@@ -601,7 +644,7 @@ static void send_te_inst_non_sync(
 
     /*
      * Update the "updiscon" field in the current te_inst packet, to
-     * determine if the transmitted bit value of the updison field is
+     * determine if the transmitted bit value of the updiscon field is
      * the same (or inverted) value as the previously transmitted bit.
      *
      * Note: "is_updiscon" is true if the given instruction is
@@ -797,80 +840,98 @@ static void clock_the_encoder(
     }
 
     /*
-     * if the "implicit-return" feature is enabled, then we also
-     * need to maintain a call-counter, otherwise the call-counter
-     * is assumed to always be zero.
+     * If the "implicit-return" feature is enabled, then we also
+     * need to maintain the irstack depth (or call-counter),
+     * otherwise the irstack depth is assumed to always be zero.
      *
      * With a call-counter, returns will be marked as updiscon only
      * if the call-counter is zero when they occur.
      * However, calls may or may not be marked as updiscons.
      */
-    if (encoder->options.implicit_return)       /* using a call-stack counter ? */
+    if (encoder->options.implicit_return)       /* using a irstack ? */
     {
+        /*
+         * This code currently only supports the simple low-cost
+         * implementation of using a saturating "call-counter", to
+         * implement the implicit return mode ...  and thus does not
+         * support the alternative (and more robust) implementation of
+         * maintaining a real stack of expected return addresses.
+         * For now generate an unrecoverable error if an attempt is
+         * made to use the more robust alternative implementation.
+         * TODO: support both implementation options.
+         */
+        if (encoder->discovery_response.return_stack_size)
+        {
+            unrecoverable_error("encoder does not yet support a real irstack");
+        }
+
         if (curr->is_call)   /* was it a (non-tail) function call ? */
         {
-            const size_t call_counter_max = (size_t)1 << (encoder->discovery_response.call_counter_width + 2);
-            assert(encoder->call_counter <= call_counter_max);
-            assert(call_counter_max <= TE_MAX_CALL_DEPTH);
+            const size_t irstack_depth_max =
+                (encoder->discovery_response.return_stack_size) ?
+                    (size_t)1 << encoder->discovery_response.return_stack_size :
+                    (size_t)1 << encoder->discovery_response.call_counter_size;
+            assert(encoder->irstack_depth <= irstack_depth_max);
+            assert(irstack_depth_max <= TE_MAX_IRSTACK_DEPTH);
             /*
-             * We will *always* push the newest return address on to the call-stack.
-             * The question is: do we drop the oldest return address on the call-stack?
-             * Optionally show what we will push onto the call stack
+             * We will *always* push the newest return address on to the irstack.
+             * The question is: do we drop the oldest return address on the irstack?
+             * Optionally show what we will push onto the irstack
              */
-            if ((encoder->debug_stream) && (encoder->debug_flags & TE_DEBUG_CALL_STACK))
+            if ((encoder->debug_stream) && (encoder->debug_flags & TE_DEBUG_IMPLICIT_RETURN))
             {
                 /*
                  * TODO: calculate and print the return address that will
-                 * be pushed onto the call-stack.
+                 * be pushed onto the irstack.
                  */
                 fprintf(encoder->debug_stream,
-                    "call-stack: pushed [%3" PRIu64 "]\n",
-                    encoder->call_counter);
+                    "irstack: pushed [%3" PRIu64 "]\n",
+                    encoder->irstack_depth);
             }
-            if (encoder->call_counter < call_counter_max)
+            if (encoder->irstack_depth < irstack_depth_max)
             {
                 /*
-                 * counter is not yet saturated ... call-stack has room
+                 * call-counter is not yet saturated ... irstack has room
                  * for at least one more return addresses to be added
-                 * so, just push the new return address on the call-stack
+                 * so, just push the new return address on the irstack
                  */
-                encoder->call_counter++;
+                encoder->irstack_depth++;
             }
             else
             {
                 /*
-                 * counter is already saturated ... do not overflow!
-                 * We will drop the oldest return address on the call-stack.
+                 * call-counter is already saturated ... do not overflow!
+                 * We will drop the oldest return address on the irstack.
                  * Optionally advise the user we have dropped one return address!
-                 * Note: Dropping such a return address from the call-stack is
+                 * Note: Dropping such a return address from the irstack is
                  * NOT a real problem ... just an efficiency impact!
                  */
-                if ((encoder->debug_stream) && (encoder->debug_flags & TE_DEBUG_CALL_STACK))
+                if ((encoder->debug_stream) && (encoder->debug_flags & TE_DEBUG_IMPLICIT_RETURN))
                 {
                     fprintf(encoder->debug_stream,
-                        "call-stack: call-counter at maximum (%" PRIu64
+                        "irstack: irstack depth at maximum (%" PRIu64
                         ") ... dropping oldest return address!\n",
-                        encoder->call_counter);
+                        encoder->irstack_depth);
                 }
             }
         }
 
         if (curr->is_return) /* was it a function return ? */
         {
-            if (encoder->call_counter)
+            if (encoder->irstack_depth)
             {
-                encoder->call_counter--;    /* pop function */
-                /* optionally show what we will pop from the call stack */
-                if ((encoder->debug_stream) && (encoder->debug_flags & TE_DEBUG_CALL_STACK))
+                encoder->irstack_depth--;    /* pop function */
+                /* optionally show what we will pop from the irstack */
+                if ((encoder->debug_stream) && (encoder->debug_flags & TE_DEBUG_IMPLICIT_RETURN))
                 {
                     fprintf(encoder->debug_stream,
-                        "call-stack: popped [%3" PRIu64 "] --> %08" PRIx64 "\n",
-                        encoder->call_counter,
+                        "irstack: popped [%3" PRIu64 "] --> %08" PRIx64 "\n",
+                        encoder->irstack_depth,
                         next->pc);
                 }
                 /*
                  * if we are able to pop a return address successfully from the
-                 * call stack, then we must not treat the return as an updiscon.
+                 * irstack, then we must not treat the return as an updiscon.
                  * Effectively, such a return is treated as an inferrable jump!
                  * Over-write "is_updiscon" so next time this function is
                  * called, prev->is_updiscon will be false!
@@ -881,20 +942,20 @@ static void clock_the_encoder(
             else
             {
                 /*
-                 * counter is already at minimum ... do not underflow!
+                 * call-counter is already at minimum ... do not underflow!
                  * This means we cannot "pop" the return address, and we will
                  * have to revert to non implicit-return mode ... that is,
                  * we will need to treat this return as a normal updiscon!
                  * Optionally advise the user we failed to pop a return address.
-                 * Note: Dropping such a return address from the call-stack is
+                 * Note: Dropping such a return address from the irstack is
                  * NOT a real problem ... just an efficiency impact!
                  */
-                if ((encoder->debug_stream) && (encoder->debug_flags & TE_DEBUG_CALL_STACK))
+                if ((encoder->debug_stream) && (encoder->debug_flags & TE_DEBUG_IMPLICIT_RETURN))
                 {
                     fprintf(encoder->debug_stream,
-                        "call-stack: call-counter at minimum (%" PRIu64
+                        "irstack: irstack depth at minimum (%" PRIu64
                         ") ... no return address to pop!\n",
-                        encoder->call_counter);
+                        encoder->irstack_depth);
                 }
             }
         }
@@ -904,7 +965,7 @@ static void clock_the_encoder(
      * last instruction was an unpredictable discontinuity?
      *
      * However, do not send a te_inst packet if it was an implicit
-     * return (i.e. one that was popped from a call-stack).
+     * return (i.e. one that was popped from the irstack).
      */
     if (prev->is_updiscon)
     {
@@ -1087,6 +1148,7 @@ te_encoder_state_t * te_open_trace_encoder(
     encoder->discovery_response = default_discovery_response;
     encoder->options = default_support_options;
     encoder->set_trace = default_set_trace;
+    encoder->encoder_mode = default_set_trace.encoder_mode;
 
     return encoder;
 }
@@ -1094,7 +1156,7 @@ te_encoder_state_t * te_open_trace_encoder(
 
 /*
  * Process a single trace-encoder cycle.
- * Called each time an instruction retires.
+ * Called each time an instruction retires, or generates an exception.
  */
 void te_encode_one_irecord(
     te_encoder_state_t * const encoder,
@@ -1122,8 +1184,18 @@ void te_encode_one_irecord(
     if (encoder->second &&              /* 2nd stage is filled */
         encoder->second->is_qualified)  /* ... and qualified ? */
     {
-        /* advance the count of PC transitions */
-        encoder->statistics.num_instructions++;
+        /*
+         * advance the count of PC transitions ...
+         * or the number of exceptions if it raises an exception
+         */
+        if (encoder->second->is_exception)
+        {
+            encoder->statistics.num_exceptions++;
+        }
+        else
+        {
+            encoder->statistics.num_instructions++;
+        }
 
         clock_the_encoder(encoder);
     }

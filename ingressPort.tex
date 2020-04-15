@@ -103,29 +103,33 @@ Jumps may optionally be further classified according to the recommended calling 
     \begin{itemize}
       \item \textbf{\textit{jal}} x1;
       \item \textbf{\textit{jal}} x5;
-      \item \textbf{\textit{jalr}} x1, rs  where rs != x1;
-      \item \textbf{\textit{jalr}} x5, rs  where rs != x5;
-      \item \textbf{\textit{c.jalr}} rs1.
+      \item \textbf{\textit{jalr}} x1, rs  where rs != x5;
+      \item \textbf{\textit{jalr}} x5, rs  where rs != x1;
+      \item \textbf{\textit{c.jalr}} rs1 where rs1 != x5;
+      \item \textbf{\textit{c.jal}}.
     \end{itemize}
   \item \textit{Tail-calls}: 
     \begin{itemize}
+      \item \textbf{\textit{jal}} x0;
+      \item \textbf{\textit{c.j}};
       \item \textbf{\textit{jalr}} x0, rs where rs != x1 and rs != x5;
       \item \textbf{\textit{c.jr}} rs1 where rs1 != x1 and rs1 != x5.
     \end{itemize}
   \item \textit{Returns}: 
     \begin{itemize}
-      \item \textbf{\textit{jalr}} x0, rs where rs == x1 or rs == x5;
+      \item \textbf{\textit{jalr}} rd, rs where (rs == x1 or rs == x5) and rd != x1 and rd != x5;
       \item \textbf{\textit{c.jr}} rs1 where rs1 == x1 or rs1 == x5.
     \end{itemize}
   \item \textit{Co-routine swap}: 
     \begin{itemize}
-      \item \textbf{\textit{jalr}} x1, x1;
-      \item \textbf{\textit{jalr}} x5, x5.
+      \item \textbf{\textit{jalr}} x1, x5;
+      \item \textbf{\textit{jalr}} x5, x1;
+      \item \textbf{\textit{c.jalr}} x5.
     \end{itemize}
   \item \textit{Other}: 
     \begin{itemize}
       \item \textbf{\textit{jal}} rd where rd != x1 and rd != x5;
-      \item \textbf{\textit{jalr}} rd, rs where rd != x0 and rd != x1 and rd != x5.
+      \item \textbf{\textit{jalr}} rd, rs where rs != x1 and rs != x5 and rd != x0 and rd != x1 and rd != x5.
     \end{itemize}
 \end{itemize}
 
@@ -185,13 +189,13 @@ Signals are assigned to one of the  following groups:
         4: Nontaken branch;\newline
         5: Taken branch;\newline
         6: Uninferable jump if \textit{itype\_width\_p} is 3, reserved otherwise;\newline
-        7: Co-routine swap if \textit{itype\_width\_p} is 4, reserved otherwise;\newline
+        7: reserved;\newline
         8: Uninferable call;\newline
         9: Inferrable call;\newline
         10: Uninferable tail-call;\newline
         11: Inferrable tail-call;\newline
-        12: Uninferable return;\newline
-        13: Inferrable return;\newline
+        12: Co-routine swap;\newline
+        13: Return;\newline
         14: Other uninferable jump;\newline
         15: Other inferable jump.\\
         \hline
