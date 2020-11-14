@@ -11,8 +11,8 @@ The following information is mandatory:
 
 \begin{itemize}
   \item The number of instructions that are being retired;
-  \item Whether there has been an exception or interrupt, and if so the cause (from the \textbf{\textit{ucause/scause/mcause}} CSR)
-        and trap value (from the \textbf{\textit{utval/stval/mtval}} CSR).
+  \item Whether there has been an exception or interrupt, and if so the cause (from the \textbf{\textit{ucause/scause/vscause/mcause}} CSR)
+        and trap value (from the \textbf{\textit{utval/stval/vstval/mtval}} CSR).
 
 \textcolor{green}{The register set to output should be the set that is updated as a
 result of the exception (i.e. the set associated with the privilege
@@ -207,12 +207,12 @@ Signals are assigned to one of the  following groups:
         14: Other uninferable jump;\newline
         15: Other inferable jump.\\
         \hline
-        \textbf{cause}[\textit{ecause\_width\_p}-1:0] & M & Exception or interrupt cause (\textbf{\textit{ucause/scause/ mcause}}).
+        \textbf{cause}[\textit{ecause\_width\_p}-1:0] & M & Exception or interrupt cause (\textbf{\textit{ucause/scause/vscause/mcause}}).
         Ignored unless \textbf {itype}=1 or 2.\\
         \hline
         \textbf{tval}[\textit{iaddress\_width\_p}-1:0] & M & The associated trap value, e.g. the
         faulting virtual address for address exceptions, as would be
-        written to the \textbf{utval/stval/mtval} CSR. Future optional extensions may define \textbf{tval} 
+        written to the \textbf{utval/stval/vstval/mtval} CSR. Future optional extensions may define \textbf{tval} 
         to provide ancillary information in cases where it currently supplies zero.
         Ignored unless \textbf{itype}=1 or 2.\\
         \hline
